@@ -1,6 +1,19 @@
 name: Compile SourceMod Plugins
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    paths-ignore:
+      - README.md
+      - LICENSE
+      - .gitignore
+      - .github/FUNDING.yml
+  pull_request:
+    paths-ignore:
+      - README.md
+      - LICENSE
+      - .gitignore
+      - .github/FUNDING.yml
+  workflow_dispatch:
 
 jobs:
   build:
