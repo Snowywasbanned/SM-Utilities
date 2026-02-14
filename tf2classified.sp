@@ -1,12 +1,26 @@
 #include <sourcemod>
 #include <sdktools>
 #include <multicolors>
+#include <regex>
+#include <entitylump>
+
+#include <heapons/shared>
 
 #undef REQUIRE_EXTENSIONS
 #include <heapons/tf2>
 #define REQUIRE_EXTENSIONS
 
-#define PLUGIN_PREFIX "{#4C4C4C}[{#F69E1D}S{#5596CF}M{#4C4C4C} {#F8FBFF}Utilities\x01]\x01"
+#define PLUGIN_PREFIX "{#4C4C4C}[{#F69E1D}Source{#5596CF}Mod{#4C4C4C}]\x01"
+
+enum
+{
+    convert_mobster_vip,
+    truce_active,
+
+    MAX_CONVARS
+}
+
+ConVar g_ConVars[MAX_CONVARS];
 
 bool g_ThirdPerson[MAXPLAYERS + 1];
 
@@ -15,7 +29,7 @@ public Plugin myinfo =
     name = "SM Utilities | TF2 Classified Tools",
     author = "Heapons",
     description = "Tools and utilities for Team Fortress 2 Classified",
-    version = "26w06a",
+    version = "26w07a",
     url = "https://github.com/Heapons/SM-Utilities"
 };
 
@@ -23,6 +37,10 @@ public void OnPluginStart()
 {
     /* Events */
     HookEvent("player_spawn", Event_PlayerSpawn, EventHookMode_Post);
+
+    /* ConVars */
+    g_ConVars[convert_mobster_vip] = CreateConVar("sm_convert_mobster_vip", "1", "Convert Mobster VIP to TF2C VIP.", _, true, 0.0, true, 1.0);
+    g_ConVars[truce_active]        = CreateConVar("sm_truce_active", "0", "Toggle truce mode.", _, true, 0.0, true, 1.0);
 
     /* Commands */
     // @admins
@@ -50,6 +68,9 @@ public void OnPluginStart()
 
     RegAdminCmd("sm_hint", Command_HintSay, ADMFLAG_GENERIC);
 
+    RegAdminCmd("sm_addcond", Command_AddCondition, ADMFLAG_GENERIC);
+    RegAdminCmd("sm_removecond", Command_RemoveCondition, ADMFLAG_GENERIC);
+
     // @everyone
     RegConsoleCmd("sm_fp", Command_FirstPerson);
     RegConsoleCmd("sm_firstperson", Command_FirstPerson);
@@ -64,19 +85,187 @@ public void OnPluginStart()
     AddMultiTargetFilter("@vips",   TargetFilter_Civilians,  "Civilians", true);
 }
 
+void OnConVarChange(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+    for (int i = 0; i < MAX_CONVARS; i++)
+    {
+        if (convar == g_ConVars[i])
+        {
+            switch (i)
+            {
+                case truce_active:
+                {
+                    GameRules_SetProp("m_bTruceActive", convar.BoolValue);
+                }
+            }
+            break;
+        }
+    }
+}
+
+public void OnMapInit()
+{
+    if (g_ConVars[convert_mobster_vip].BoolValue)
+    {
+        int lumpLength = EntityLump.Length();
+        EntityLumpEntry entry;
+        char classname[64], buffer[256];
+
+        for (int i = lumpLength - 1; i >= 0; i--)
+        {
+            entry = EntityLump.Get(i);
+
+            if (entry.GetNextKey("classname", classname, sizeof(classname), -1) != -1 && StrEqual(classname, "logic_script", false))
+            {
+                if (entry.GetNextKey("vscripts", buffer, sizeof(buffer), -1) != -1 && StrContains(buffer, "vip/vip.nut", false) != -1)
+                {
+                    EntityLump.Erase(i);
+                    continue;
+                }
+            }
+            int pos = -1;
+            while ((pos = entry.GetNextKey("OnMapSpawn", buffer, sizeof(buffer), pos)) != -1)
+            {
+                if (StrContains(buffer, "cane", false) != -1)
+                {
+                    EntityLump.Erase(i);
+                    break;
+                }
+            }
+            CloseHandle(entry);
+        }
+        int index = EntityLump.Append();
+        entry = EntityLump.Get(index);
+        entry.Append("classname", "tf2c_logic_vip");
+        entry.Append("blue_escort", "1");
+        entry.Append("show_escort_progress", "1");
+        entry.Append("hud_type", "1");
+        entry.Append("vehicle_type", "2");
+        CloseHandle(entry);
+    }
+}
+
+public void OnMapStart()
+{
+    // Item Schema
+    char path[PLATFORM_MAX_PATH] = "scripts/items/custom_items_game.txt";
+	if (FileExists(path))
+	{
+		PrecacheGeneric(path, true);
+		AddFileToDownloadsTable(path);
+	}
+
+    // Global
+    ArrayList dirs = new ArrayList(PLATFORM_MAX_PATH);
+    DirectoryListing custom = OpenDirectory("custom");
+    char entry[PLATFORM_MAX_PATH];
+    FileType fileType;
+    char ext[16];
+    char dir[PLATFORM_MAX_PATH];
+
+    if (custom != null)
+    {
+        while (custom.GetNext(entry, sizeof(entry), fileType))
+        {
+            if (fileType == FileType_Directory && StrContains(entry, "global", false) == 0)
+            {
+                Format(path, sizeof(path), "custom/%s", entry);
+                dirs.PushString(path);
+            }
+        }
+        delete custom;
+    }
+
+    while (dirs.Length > 0)
+    {
+        dirs.GetString(dirs.Length - 1, dir, sizeof(dir));
+        dirs.Erase(dirs.Length - 1);
+
+        DirectoryListing listing = OpenDirectory(dir);
+        if (listing == null)
+        {
+            continue;
+        }
+
+        while (listing.GetNext(entry, sizeof(entry), fileType))
+        {
+            if (StrEqual(entry, ".") || StrEqual(entry, ".."))
+            {
+                continue;
+            }
+
+            Format(path, sizeof(path), "%s/%s", dir, entry);
+
+            if (fileType == FileType_Directory)
+            {
+                dirs.PushString(path);
+                continue;
+            }
+
+            if (!FileExists(path))
+            {
+                continue;
+            }
+
+            AddFileToDownloadsTable(path);
+
+            int maxlen = strlen(path);
+            bool isModelFile, isDecalFile;
+
+            isModelFile = StrEqual(path[maxlen - 4], ".mdl", false) ||
+                          StrEqual(path[maxlen - 4], ".vcd", false) ||
+                          StrEqual(path[maxlen - 4], ".vvd", false) ||
+                          StrEqual(path[maxlen - 4], ".phy", false) ||
+                          StrEqual(path[maxlen - 4], ".vtx", false) ||
+                          StrEqual(path[maxlen - 7], ".sw.vtx", false) ||
+                          StrEqual(path[maxlen - 9], ".dx80.vtx", false) ||
+                          StrEqual(path[maxlen - 9], ".dx90.vtx", false);
+
+            isDecalFile = StrEqual(path[maxlen - 4], ".vmt", false) ||
+                          StrEqual(path[maxlen - 4], ".vtf", false);
+
+            PrecacheGeneric(path);
+
+            if (isModelFile)
+            {
+                PrecacheModel(path);
+            }
+            else if (isDecalFile)
+            {
+                PrecacheDecal(path);
+            }
+            else
+            {
+                ext[0] = '\0';
+                int dotPos = FindCharInString(path, '.', true);
+                if (dotPos != -1)
+                {
+                    strcopy(ext, sizeof(ext), path[dotPos + 1]);
+                }
+
+                if (StrEqual(ext, "wav", false) || StrEqual(ext, "mp3", false))
+                {
+                    PrecacheSound(path);
+                }
+            }
+        }
+        delete listing;
+    }
+    delete dirs;
+}
+
 public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast)
 {
     int client = GetClientOfUserId(event.GetInt("userid"));
-    TFEntity player = TFEntity(client);
+    TFEntity player = Entity(client);
 
     // Third-Person
-    player.SetForcedTauntCam(g_ThirdPerson[client]);
     CreateTimer(0.1, Timer_Event_PlayerSpawn, client, TIMER_FLAG_NO_MAPCHANGE);
 }
 
 public Action Timer_Event_PlayerSpawn(Handle timer, int client)
 {
-    TFEntity player = TFEntity(client);
+    TFEntity player = Entity(client);
     player.SetForcedTauntCam(g_ThirdPerson[client]);
     return Plugin_Stop;
 }
@@ -160,7 +349,7 @@ public Action Command_SetTeam(int client, int args)
     {
         for (int i = 0; i < targetCount; i++)
         {
-            target = TFEntity(targets[i]);
+            target = Entity(targets[i]);
             target.team = view_as<TFTeam>(teamIndex);
         }
         CReplyToCommand(client, PLUGIN_PREFIX ... " Changed \x04%d\x01 players to %s", targetCount, teamName);
@@ -169,7 +358,7 @@ public Action Command_SetTeam(int client, int args)
     {
         for (int i = 0; i < targetCount; i++)
         {
-            target = TFEntity(targets[i]);
+            target = Entity(targets[i]);
             target.team = view_as<TFTeam>(teamIndex);
         }
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Changed \x03%N\x01 to %s", target.index, teamName);
@@ -237,7 +426,7 @@ public Action Command_AddAttribute(int client, int args)
     TFEntity target;
     for (int i = 0; i < targetCount; i++)
     {
-        target = TFEntity(targets[i]);
+        target = Entity(targets[i]);
         target.AddAttribute(attrName, value, duration);
     }
 
@@ -247,7 +436,7 @@ public Action Command_AddAttribute(int client, int args)
     }
     else
     {
-        target = TFEntity(targets[0]);
+        target = Entity(targets[0]);
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Applied \x05%s\x01 to \x03%N", attrName, target.index);
     }
 
@@ -292,7 +481,7 @@ public Action Command_RemoveAttribute(int client, int args)
     TFEntity target;
     for (int i = 0; i < targetCount; i++)
     {
-        target = TFEntity(targets[i]);
+        target = Entity(targets[i]);
         target.RemoveAttribute(attrName);
     }
 
@@ -302,7 +491,7 @@ public Action Command_RemoveAttribute(int client, int args)
     }
     else
     {
-        target = TFEntity(targets[0]);
+        target = Entity(targets[0]);
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Removed \x05%s\x01 from \x03%N", attrName, target.index);
     }
 
@@ -347,9 +536,134 @@ public Action Command_GetAttribute(int client, int args)
     TFEntity target;
     for (int i = 0; i < targetCount; i++)
     {
-        target = TFEntity(targets[i]);
+        target = Entity(targets[i]);
         float value = target.GetAttribute(attrName);
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Attribute \x05%s\x01 for \x03%N: \x04%.3f", attrName, target.index, value);
+    }
+
+    return Plugin_Handled;
+}
+
+public Action Command_AddCondition(int client, int args)
+{
+    if (args < 1)
+    {
+        ReplyToCommand(client, "Usage: sm_addcond [target] <condition> [duration]");
+        return Plugin_Handled;
+    }
+
+    char targetArg[64];
+    char condArg[16];
+    char durationArg[32] = "-1.0";
+
+    switch (args)
+    {
+        case 1:
+        {
+            GetCmdArg(1, condArg, sizeof(condArg));
+            strcopy(targetArg, sizeof(targetArg), "@me");
+        }
+        case 2:
+        {
+            GetCmdArg(1, targetArg, sizeof(targetArg));
+            GetCmdArg(2, condArg, sizeof(condArg));
+        }
+        default:
+        {
+            GetCmdArg(1, targetArg, sizeof(targetArg));
+            GetCmdArg(2, condArg, sizeof(condArg));
+            GetCmdArg(3, durationArg, sizeof(durationArg));
+        }
+    }
+
+    int condition = StringToInt(condArg);
+    float duration = StringToFloat(durationArg);
+
+    int targets[MAXPLAYERS];
+    int targetCount;
+    char targetName[MAX_TARGET_LENGTH];
+    bool tn_is_ml;
+
+    targetCount = ProcessTargetString(targetArg, client, targets, sizeof(targets), COMMAND_FILTER_CONNECTED, targetName, sizeof(targetName), tn_is_ml);
+
+    if (targetCount <= 0)
+    {
+        ReplyToTargetError(client, targetCount);
+        return Plugin_Handled;
+    }
+
+    TFEntity target;
+    for (int i = 0; i < targetCount; i++)
+    {
+        target = Entity(targets[i]);
+        target.AddCond(condition, duration);
+    }
+
+    if (targetCount > 1)
+    {
+        CReplyToCommand(client, PLUGIN_PREFIX ... " Added condition \x05%d\x01 to \x04%d\x01 players", condition, targetCount);
+    }
+    else
+    {
+        target = Entity(targets[0]);
+        CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Added condition \x05%d\x01 to \x03%N", condition, target.index);
+    }
+
+    return Plugin_Handled;
+}
+
+public Action Command_RemoveCondition(int client, int args)
+{
+    if (args < 1)
+    {
+        ReplyToCommand(client, "Usage: sm_removecond [target] <condition>");
+        return Plugin_Handled;
+    }
+
+    char targetArg[64];
+    char condArg[16];
+
+    if (args == 1)
+    {
+        GetCmdArg(1, condArg, sizeof(condArg));
+        strcopy(targetArg, sizeof(targetArg), "@me");
+    }
+    else
+    {
+        GetCmdArg(1, targetArg, sizeof(targetArg));
+        GetCmdArg(2, condArg, sizeof(condArg));
+    }
+
+    int condition = StringToInt(condArg);
+
+    int targets[MAXPLAYERS];
+    int targetCount;
+    char targetName[MAX_TARGET_LENGTH];
+    bool tn_is_ml;
+
+    targetCount = ProcessTargetString(targetArg, client, targets, sizeof(targets), COMMAND_FILTER_CONNECTED, targetName, sizeof(targetName), tn_is_ml);
+
+    if (targetCount <= 0)
+    {
+        ReplyToTargetError(client, targetCount);
+        return Plugin_Handled;
+    }
+
+    TFEntity target;
+    for (int i = 0; i < targetCount; i++)
+    {
+        target = Entity(targets[i]);
+        target.RemoveCond(condition);
+    }
+
+    if (targetCount > 1)
+    {
+        CReplyToCommand(client, PLUGIN_PREFIX ... " Removed condition \x05%d\x01 from \x04%d\x01 players", condition, targetCount);
+    }
+    else
+    {
+        target = Entity(targets[0]);
+        CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Removed condition \x05%d\x01 from \x03%N", condition, target.index);
     }
 
     return Plugin_Handled;
@@ -395,7 +709,7 @@ public Action Command_Currency(int client, int args)
     TFEntity target;
     for (int i = 0; i < targetCount; i++)
     {
-        target = TFEntity(targets[i]);
+        target = Entity(targets[i]);
         target.currency = value;
     }
 
@@ -405,7 +719,7 @@ public Action Command_Currency(int client, int args)
     }
     else
     {
-        target = TFEntity(targets[0]);
+        target = Entity(targets[0]);
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Set currency to \x05%d\x01 for \x03%N", value, target.index);
     }
 
@@ -452,7 +766,7 @@ public Action Command_Scale(int client, int args)
     TFEntity target;
     for (int i = 0; i < targetCount; i++)
     {
-        target = TFEntity(targets[i]);
+        target = Entity(targets[i]);
         target.scale = value;
     }
 
@@ -462,7 +776,7 @@ public Action Command_Scale(int client, int args)
     }
     else
     {
-        target = TFEntity(targets[0]);
+        target = Entity(targets[0]);
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Set scale to \x05%.2f\x01 for \x03%N", value, target.index);
     }
 
@@ -509,7 +823,7 @@ public Action Command_Health(int client, int args)
     TFEntity target;
     for (int i = 0; i < targetCount; i++)
     {
-        target = TFEntity(targets[i]);
+        target = Entity(targets[i]);
         target.health = value;
     }
 
@@ -519,7 +833,7 @@ public Action Command_Health(int client, int args)
     }
     else
     {
-        target = TFEntity(targets[0]);
+        target = Entity(targets[0]);
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Set health to \x05%d\x01 for \x03%N", value, target.index);
     }
 
@@ -566,7 +880,7 @@ public Action Command_MaxHealth(int client, int args)
     TFEntity target;
     for (int i = 0; i < targetCount; i++)
     {
-        target = TFEntity(targets[i]);
+        target = Entity(targets[i]);
         target.max_health = value;
     }
 
@@ -576,7 +890,7 @@ public Action Command_MaxHealth(int client, int args)
     }
     else
     {
-        target = TFEntity(targets[0]);
+        target = Entity(targets[0]);
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Set max health to \x05%d\x01 for \x03%N", value, target.index);
     }
 
@@ -681,7 +995,7 @@ public Action Command_SetClass(int client, int args)
     {
         for (int i = 0; i < targetCount; i++)
         {
-            target = TFEntity(targets[i]);
+            target = Entity(targets[i]);
             target.class = classType;
         }
         CReplyToCommand(client, PLUGIN_PREFIX ... " Changed \x04%d\x01 players into \x05%s", targetCount, className);
@@ -690,7 +1004,7 @@ public Action Command_SetClass(int client, int args)
     {
         for (int i = 0; i < targetCount; i++)
         {
-            target = TFEntity(targets[i]);
+            target = Entity(targets[i]);
             target.class = classType;
             CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Changed \x03%N\x01 into \x05%s", target.index, className);
         }
@@ -737,7 +1051,7 @@ public Action Command_FireInput(int client, int args)
     TFEntity target;
     for (int i = 0; i < targetCount; i++)
     {
-        target = TFEntity(targets[i]);
+        target = Entity(targets[i]);
         int intValue;
         if (entityValue[0] != '\0' && StringToIntEx(entityValue, intValue) > 0)
         {
@@ -756,7 +1070,7 @@ public Action Command_FireInput(int client, int args)
     }
     else
     {
-        target = TFEntity(targets[0]);
+        target = Entity(targets[0]);
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Fired \x05%s\x01 on \x03%N", entityInput, target.index);
     }
 
@@ -791,7 +1105,7 @@ public Action Command_Respawn(int client, int args)
     TFEntity target;
     for (int i = 0; i < targetCount; i++)
     {
-        target = TFEntity(targets[i]);
+        target = Entity(targets[i]);
         target.ForceRespawn();
     }
 
@@ -801,7 +1115,7 @@ public Action Command_Respawn(int client, int args)
     }
     else
     {
-        target = TFEntity(targets[0]);
+        target = Entity(targets[0]);
         CReplyToCommandEx(client, target.index, PLUGIN_PREFIX ... " Respawned \x03%N", target.index);
     }
 
@@ -814,7 +1128,7 @@ public Action Command_FirstPerson(int client, int args)
         return Plugin_Handled;
         
     g_ThirdPerson[client] = false;
-    TFEntity player = TFEntity(client);
+    TFEntity player = Entity(client);
     player.SetForcedTauntCam(false);
     
     CReplyToCommand(client, PLUGIN_PREFIX ... " Set view to \x04First-Person");
@@ -827,7 +1141,7 @@ public Action Command_ThirdPerson(int client, int args)
         return Plugin_Handled;
         
     g_ThirdPerson[client] = true;
-    TFEntity player = TFEntity(client);
+    TFEntity player = Entity(client);
     player.SetForcedTauntCam(true);
     
     CReplyToCommand(client, PLUGIN_PREFIX ... " Set view to \x04Third-Person");
@@ -885,48 +1199,44 @@ public Action Command_HintSay(int client, int args)
 
     for (int i = 0; i < targetCount; i++)
     {
-        int hint = CreateEntityByName("env_instructor_hint");
-        if (hint == -1)
+        TFEntity target = Entity(targets[i]);
+        if (!IsClientInGame(target.index))
         {
-            ReplyToCommand(client, "Failed to create instructor hint.");
             continue;
         }
 
-        char playerIndex[16];
-        IntToString(targets[i], playerIndex, sizeof(playerIndex));
+        Event event = CreateEvent("instructor_server_hint_create", true);
+        if (event == null)
+        {
+            continue;
+        }
 
-        DispatchKeyValue(hint, "hint_replace_key", "sm_hint");
-        DispatchKeyValue(hint, "hint_caption", message);
-        DispatchKeyValue(hint, "hint_icon_onscreen", icon);
-        DispatchKeyValue(hint, "hint_icon_offscreen", icon);
-        DispatchKeyValue(hint, "hint_static", "1");
-        DispatchKeyValue(hint, "hint_target", playerIndex);
-        char durationValue[32];
-        FloatToString(duration, durationValue, sizeof(durationValue));
-        DispatchKeyValue(hint, "hint_timeout", durationValue);
-        DispatchSpawn(hint);
-        AcceptEntityInput(hint, "ShowHint", targets[i], targets[i]);
-
-        DataPack dp = new DataPack();
-        dp.WriteCell(EntIndexToEntRef(hint));
-        CreateTimer(duration, Timer_KillInstructorHint, dp, TIMER_FLAG_NO_MAPCHANGE);
+        char hintName[64];
+        Format(hintName, sizeof(hintName), "sm_hint_%N", target);
+        event.SetString("hint_name", hintName);
+        event.SetString("hint_replace_key", "sm_hint");
+        event.SetInt("hint_target", GetClientUserId(target));
+        event.SetInt("hint_activator_userid", GetClientUserId(target));
+        event.SetInt("hint_timeout", RoundToNearest(duration));
+        event.SetString("hint_icon_onscreen", icon);
+        event.SetString("hint_icon_offscreen", icon);
+        event.SetString("hint_activator_caption", message);
+        event.SetString("hint_color", "255,255,255");
+        event.SetFloat("hint_icon_offset", 0.0);
+        event.SetFloat("hint_range", 0.0);
+        event.SetInt("hint_flags", 0);
+        event.SetString("hint_binding", "");
+        event.SetBool("hint_allow_nodraw_target", true);
+        event.SetBool("hint_nooffscreen", false);
+        event.SetBool("hint_forcecaption", false);
+        event.SetBool("hint_local_player_only", true);
+        event.SetString("hint_start_sound", "");
+        event.SetInt("hint_target_pos", 0);
+        event.SetInt("hint_ent_spawnflags", 0);
+        event.SetInt("hint_ent_team", 0);
+        event.FireToClient(target);
     }
-
     return Plugin_Handled;
-}
-
-public Action Timer_KillInstructorHint(Handle timer, DataPack dp)
-{
-    dp.Reset();
-    int hint = EntRefToEntIndex(dp.ReadCell());
-    delete dp;
-
-    if (hint != -1)
-    {
-        AcceptEntityInput(hint, "Kill");
-    }
-
-    return Plugin_Stop;
 }
 
 // Target Filters
@@ -934,7 +1244,7 @@ public bool TargetFilter_RedTeam(const char[] pattern, ArrayList clients, int cl
 {
     for (int i = 1; i <= MaxClients; i++)
     {
-        if (IsClientInGame(i) && TF2_GetClientTeam(i) == TFTeam_Red)
+        if (TF2_GetClientTeam(i) == TFTeam_Red)
         {
             clients.Push(i);
         }
@@ -946,7 +1256,7 @@ public bool TargetFilter_BlueTeam(const char[] pattern, ArrayList clients, int c
 {
     for (int i = 1; i <= MaxClients; i++)
     {
-        if (IsClientInGame(i) && TF2_GetClientTeam(i) == TFTeam_Blue)
+        if (TF2_GetClientTeam(i) == TFTeam_Blue)
         {
             clients.Push(i);
         }
@@ -958,7 +1268,7 @@ public bool TargetFilter_GreenTeam(const char[] pattern, ArrayList clients, int 
 {
     for (int i = 1; i <= MaxClients; i++)
     {
-        if (IsClientInGame(i) && TF2_GetClientTeam(i) == TFTeam_Green)
+        if (TF2_GetClientTeam(i) == TFTeam_Green)
         {
             clients.Push(i);
         }
@@ -970,7 +1280,7 @@ public bool TargetFilter_YellowTeam(const char[] pattern, ArrayList clients, int
 {
     for (int i = 1; i <= MaxClients; i++)
     {
-        if (IsClientInGame(i) && TF2_GetClientTeam(i) == TFTeam_Yellow)
+        if (TF2_GetClientTeam(i) == TFTeam_Yellow)
         {
             clients.Push(i);
         }
@@ -980,17 +1290,11 @@ public bool TargetFilter_YellowTeam(const char[] pattern, ArrayList clients, int
 
 public bool TargetFilter_Civilians(const char[] pattern, ArrayList clients, int client)
 {
-    int entity = FindEntityByClassname(-1, "tf2c_logic_vip");
-	if (entity != -1)
-	{
-		return false;
-	}
-
     TFEntity target;
     for (int i = 1; i <= MaxClients; i++)
     {
-        target = TFEntity(i);
-        if (IsClientInGame(i) && target.class == TFClass_Civilian)
+        target = Entity(i);
+        if (target.class == TFClass_Civilian)
         {
             clients.Push(i);
         }
